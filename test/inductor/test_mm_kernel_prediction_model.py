@@ -3,9 +3,8 @@
 import os
 import unittest
 import unittest.mock as mock
-
-import numpy as np
-import pandas as pd
+from math import exp
+from unittest import skipIf
 
 import torch
 from torch._inductor.config import (
@@ -25,47 +24,48 @@ from torch._inductor.test_case import run_tests, TestCase
 from torch.testing._internal.inductor_utils import HAS_CPU, HAS_GPU
 
 
+def mock_device_if_cuda_unavailable(function):
+    def wrapper(*args, **kwargs):
+        if torch.cuda.is_available():
+            return function(*args, **kwargs)
+        with mock.patch("torch.device", return_value=torch.device("cpu")):
+            return function(*args, **kwargs)
+
+    return wrapper
+
+
 class TestMMKernelPredictionModel(TestCase):
     def test_get_total_gb_feature(self) -> None:
-        # Create a test dataframe
-        df = pd.DataFrame(
-            {
-                "dim_m": [1000, 2000],
-                "dim_n": [2000, 4000],
-                "dim_k": [3000, 6000],
-                "dtype_size": [16, 32],  # 16-bit and 32-bit dtypes
-            }
-        )
+        # Create a test dict of tensors
+        dict_of_features = {
+            "dim_m": torch.tensor([1000, 2000]),
+            "dim_n": torch.tensor([2000, 4000]),
+            "dim_k": torch.tensor([3000, 6000]),
+            # 16-bit and 32-bit dtypes
+            "dtype_size": torch.tensor([16, 32]),
+        }
 
         # Calculate expected results manually
         # Formula: (m*k + k*n + m*n) * dtype_size/8 / 1e9
-        expected_results = pd.Series([(2 + 3 + 6) * 2 / 1e3, (8 + 12 + 24) * 4 / 1e3])
-
-        # Get actual results
-        actual_results = get_total_gb_feature(df)
-
-        # Compare results
-        pd.testing.assert_series_equal(
-            actual_results, expected_results, check_names=False
+        expected_results = torch.tensor(
+            [(2 + 3 + 6) * 2 / 1e3, (8 + 12 + 24) * 4 / 1e3]
         )
+
+        actual_results = get_total_gb_feature(dict_of_features=dict_of_features)
+        self.assertTrue(torch.allclose(actual_results, expected_results))
 
     def test_get_total_gflop_feature(self) -> None:
-        df = pd.DataFrame(
-            {
-                "dim_m": [1000, 2000],
-                "dim_n": [2000, 4000],
-                "dim_k": [3000, 6000],
-            }
-        )
+        dict_of_features = {
+            "dim_m": torch.tensor([1000, 2000]),
+            "dim_n": torch.tensor([2000, 4000]),
+            "dim_k": torch.tensor([3000, 6000]),
+        }
 
-        expected_results = pd.Series([12.0, 12.0 * 8])
+        expected_results = torch.tensor([12.0, 12.0 * 8])
+        actual_results = get_total_gflop_feature(dict_of_features=dict_of_features)
+        self.assertTrue(torch.allclose(actual_results, expected_results))
 
-        actual_results = get_total_gflop_feature(df)
-
-        pd.testing.assert_series_equal(
-            actual_results, expected_results, check_names=False
-        )
-
+    @mock_device_if_cuda_unavailable
     def test_nn(self) -> None:
         kernel_overhead = 0.5
 
@@ -74,7 +74,7 @@ class TestMMKernelPredictionModel(TestCase):
             hidden_layer_widths=[4, 5],
             kernel_overhead=0.5,
         )
-        nn.to(device="cuda")
+        nn.to(device=torch.device("cuda"))
         # Set all weights to 0
         for param in nn.parameters():
             param.data.fill_(0)
@@ -83,7 +83,7 @@ class TestMMKernelPredictionModel(TestCase):
             nn.log_kernel_overhead, torch.log(torch.tensor(0.5)).item()
         )
 
-        x = torch.ones(1, 3, device="cuda")
+        x = torch.ones(1, 3, device=torch.device("cuda"))
         with torch.no_grad():
             log_base_pred = nn.linear_relu_stack(x)
             result = nn(x)
@@ -92,27 +92,26 @@ class TestMMKernelPredictionModel(TestCase):
         # kernel_overhead + e^0
         self.assertAlmostEqual(torch.exp(result).item(), kernel_overhead + 1.0)
 
+    @mock_device_if_cuda_unavailable
     def test_get_nn_x(self) -> None:
-        df = pd.DataFrame(
-            {
-                "dim_m": [10, 12],
-                "dim_n": [20, 22],
-                "antartica": ["fly", "boat"],
-                "dim_k": [4, 2],
-                "dtype_size": [16, 32],
-                "config_block_n": [32, 64],
-                "config_block_k": [16, 32],
-                "config_block_m": [1, 2],
-                "config_num_stages": [2, 3],
-                "config_num_warps": [4, 8],
-                "total_gb": [0.1, 0.2],
-                "total_gflop": [0.3, 0.4],
-                "flops_per_byte": [0.5, 0.6],
-            }
-        )
+        dict_of_features = {
+            "dim_m": [10, 12],
+            "dim_n": [20, 22],
+            "dim_k": [4, 2],
+            "dtype_size": [16, 32],
+            "config_block_n": [32, 64],
+            "config_block_k": [16, 32],
+            "config_block_m": [1, 2],
+            "config_num_stages": [2, 3],
+            "config_num_warps": [4, 8],
+            "total_gb": [0.1, 0.2],
+            "total_gflop": [0.3, 0.4],
+            "flops_per_byte": [0.5, 0.6],
+        }
+        dict_of_features = {k: torch.tensor(v) for k, v in dict_of_features.items()}
 
         with self.subTest("Mean and variance not provided"):
-            t, mean, std = get_nn_x(df=df)
+            t, mean, std = get_nn_x(dict_of_features=dict_of_features)
             expected_t = torch.tensor(
                 [
                     [
@@ -144,7 +143,7 @@ class TestMMKernelPredictionModel(TestCase):
                         0.7071,
                     ],
                 ],
-                device="cuda",
+                device=torch.device("cuda"),
             )
             self.assertTrue(torch.allclose(t, expected_t, atol=1e-4))
 
@@ -164,7 +163,7 @@ class TestMMKernelPredictionModel(TestCase):
                     1.7329,
                 ],
                 dtype=torch.double,
-                device="cuda",
+                device=torch.device("cuda"),
             )
             self.assertTrue(torch.allclose(mean, expected_mean, atol=1e-4))
             expected_std = torch.tensor(
@@ -183,14 +182,20 @@ class TestMMKernelPredictionModel(TestCase):
                     0.4901,
                 ],
                 dtype=torch.float64,
-                device="cuda",
+                device=torch.device("cuda"),
             )
             self.assertTrue(torch.allclose(std, expected_std, atol=1e-4))
 
         with self.subTest("Mean and variance provided"):
-            mean_ = torch.linspace(1, 2, 12, dtype=torch.float64, device="cuda")
-            std_ = torch.linspace(3, 4, 12, dtype=torch.float64, device="cuda")
-            t, mean, std = get_nn_x(df=df, mean=mean_, std=std_)
+            mean_ = torch.linspace(
+                1, 2, 12, dtype=torch.float64, device=torch.device("cuda")
+            )
+            std_ = torch.linspace(
+                3, 4, 12, dtype=torch.float64, device=torch.device("cuda")
+            )
+            t, mean, std = get_nn_x(
+                dict_of_features=dict_of_features, mean=mean_, std=std_
+            )
             expected_t = torch.tensor(
                 [
                     [
@@ -222,7 +227,7 @@ class TestMMKernelPredictionModel(TestCase):
                         0.0199,
                     ],
                 ],
-                device="cuda",
+                device=torch.device("cuda"),
             )
             self.assertTrue(torch.allclose(t, expected_t, atol=1e-4))
             self.assertIs(mean, mean_)
@@ -243,18 +248,22 @@ class TestMMKernelPredictionModel(TestCase):
                 "config_num_stages",
                 "config_num_warps",
             ]
-            df = pd.DataFrame({col: [np.exp(1), np.exp(3)] for col in cols})
+            dict_of_features = {col: torch.tensor([exp(1), exp(3)]) for col in cols}
             t, mean, std = get_nn_x(
-                df=df,
-                mean=2 * torch.ones(len(cols), device="cuda"),
-                std=torch.ones(len(cols), device="cuda"),
+                dict_of_features=dict_of_features,
+                mean=2 * torch.ones(len(cols), device=torch.device("cuda")),
+                std=torch.ones(len(cols), device=torch.device("cuda")),
             )
             self.assertEqual(t.shape, (2, len(cols)))
             self.assertTrue(
-                torch.allclose(t[0, :], -torch.ones(len(cols), device="cuda"))
+                torch.allclose(
+                    t[0, :], -torch.ones(len(cols), device=torch.device("cuda"))
+                )
             )
             self.assertTrue(
-                torch.allclose(t[1, :], torch.ones(len(cols), device="cuda"))
+                torch.allclose(
+                    t[1, :], torch.ones(len(cols), device=torch.device("cuda"))
+                )
             )
 
     def test_sanitize_path(self) -> None:
@@ -323,6 +332,7 @@ class TestMMKernelPredictionModel(TestCase):
             ):
                 ModelWrapper()
 
+    @mock_device_if_cuda_unavailable
     def test_model_wrapper_init_fallback_model(self) -> None:
         """Test ModelWrapper initialization with fallback to H100 model."""
         mock_model = NeuralNetwork(n_inputs=12, hidden_layer_widths=[64, 32])
@@ -348,24 +358,27 @@ class TestMMKernelPredictionModel(TestCase):
             call_args = mock_load.call_args[0][0]
             self.assertIn("nvidia_h100_triton_mm.pt2", call_args)
 
+    @skipIf(not torch.cuda.is_available(), "CUDA is not available")
     def test_model_wrapper_inference(self) -> None:
         """Test the inference method."""
         mock_model = mock.MagicMock()
-        mock_output = torch.tensor([[1.5, 2.0]], device="cuda")
+        mock_output = torch.tensor([[1.5, 2.0]], device=torch.device("cuda"))
         mock_model.return_value = mock_output
 
         with (
             mock.patch("torch.cuda.is_available", return_value=True),
             mock.patch("torch._inductor.aoti_load_package", return_value=mock_model),
+            mock.patch("torch.device", return_value=torch.device("cpu")),
         ):
             wrapper = ModelWrapper()
 
-            input_tensor = torch.randn(2, 12, device="cuda")
+            input_tensor = torch.randn(2, 12, device=torch.device("cuda"))
             result = wrapper.inference(input_tensor)
 
             mock_model.assert_called_once_with(input_tensor)
             self.assertEqual(result, mock_output)
 
+    @skipIf(not torch.cuda.is_available(), "CUDA is not available")
     def test_model_wrapper_decode(self) -> None:
         """Test the decode method."""
         with (
@@ -374,12 +387,13 @@ class TestMMKernelPredictionModel(TestCase):
         ):
             wrapper = ModelWrapper()
 
-            input_tensor = torch.tensor([[1.0, 2.0]], device="cuda")
+            input_tensor = torch.tensor([[1.0, 2.0]], device=torch.device("cuda"))
             result = wrapper.decode(input_tensor)
 
             # decode should return the input tensor unchanged
             self.assertTrue(torch.equal(result, input_tensor))
 
+    @mock_device_if_cuda_unavailable
     def test_model_wrapper_device_name_parameter(self) -> None:
         """Test ModelWrapper initialization with explicit device name."""
         mock_model = NeuralNetwork(n_inputs=12, hidden_layer_widths=[64, 32])
@@ -421,15 +435,16 @@ class TestMMKernelPredictionModel(TestCase):
             self.assertIsInstance(result1, ModelWrapper)
             self.assertIs(result1, result2)
 
+    @mock_device_if_cuda_unavailable
     def test_neural_network_forward_edge_cases(self) -> None:
         """Test NeuralNetwork forward method with edge cases."""
         nn = NeuralNetwork(n_inputs=2, hidden_layer_widths=[4], kernel_overhead=0.001)
-        nn.to(device="cuda")  # Move model to CUDA
+        nn.to(device=torch.device("cuda"))
         nn.eval()  # Set to evaluation mode to avoid BatchNorm issues with single samples
 
         # Test with different input shapes
-        x_single = torch.randn(1, 2, device="cuda")
-        x_batch = torch.randn(5, 2, device="cuda")
+        x_single = torch.randn(1, 2, device=torch.device("cuda"))
+        x_batch = torch.randn(5, 2, device=torch.device("cuda"))
 
         with torch.no_grad():
             result_single = nn(x_single)
@@ -442,6 +457,7 @@ class TestMMKernelPredictionModel(TestCase):
         self.assertTrue(torch.isfinite(result_single).all())
         self.assertTrue(torch.isfinite(result_batch).all())
 
+    @skipIf(not torch.cuda.is_available(), "CUDA is not available")
     def test_model_wrapper_encode_edge_cases(self) -> None:
         """Test ModelWrapper encode method with edge cases."""
         mock_model = NeuralNetwork(n_inputs=12, hidden_layer_widths=[64, 32])
@@ -480,58 +496,50 @@ class TestMMKernelPredictionModel(TestCase):
     def test_get_total_gb_feature_edge_cases(self) -> None:
         """Test get_total_gb_feature with edge cases."""
         # Test with very small values
-        df_small = pd.DataFrame(
-            {
-                "dim_m": [1],
-                "dim_n": [1],
-                "dim_k": [1],
-                "dtype_size": [8],  # 8-bit dtype
-            }
-        )
-        result = get_total_gb_feature(df_small)
+        features_small = {
+            "dim_m": torch.tensor([1]),
+            "dim_n": torch.tensor([1]),
+            "dim_k": torch.tensor([1]),
+            "dtype_size": torch.tensor([8]),  # 8-bit dtype
+        }
+        result = get_total_gb_feature(dict_of_features=features_small)
         expected = (1 * 1 + 1 * 1 + 1 * 1) * (8 / 8) / 1e9  # 3 bytes / 1e9
-        self.assertAlmostEqual(result.iloc[0], expected)
+        self.assertAlmostEqual(result[0], expected)
 
         # Test with very large values
-        df_large = pd.DataFrame(
-            {
-                "dim_m": [100000],
-                "dim_n": [100000],
-                "dim_k": [100000],
-                "dtype_size": [64],  # 64-bit dtype
-            }
-        )
-        result = get_total_gb_feature(df_large)
+        df_large = {
+            "dim_m": torch.tensor([100000]),
+            "dim_n": torch.tensor([100000]),
+            "dim_k": torch.tensor([100000]),
+            "dtype_size": torch.tensor([64]),  # 64-bit dtype
+        }
+        result = get_total_gb_feature(dict_of_features=df_large)
         expected = (
             (100000 * 100000 + 100000 * 100000 + 100000 * 100000) * (64 / 8) / 1e9
         )
-        self.assertAlmostEqual(result.iloc[0], expected)
+        self.assertAlmostEqual(result[0].item(), expected, places=4)
 
     def test_get_total_gflop_feature_edge_cases(self) -> None:
         """Test get_total_gflop_feature with edge cases."""
         # Test with very small values
-        df_small = pd.DataFrame(
-            {
-                "dim_m": [1],
-                "dim_n": [1],
-                "dim_k": [1],
-            }
-        )
-        result = get_total_gflop_feature(df_small)
+        features_small = {
+            "dim_m": torch.tensor([1]),
+            "dim_n": torch.tensor([1]),
+            "dim_k": torch.tensor([1]),
+        }
+        result = get_total_gflop_feature(dict_of_features=features_small)
         expected = (2 * 1 * 1 * 1) / 1e9
-        self.assertAlmostEqual(result.iloc[0], expected)
+        self.assertAlmostEqual(result[0], expected)
 
         # Test with asymmetric dimensions
-        df_asym = pd.DataFrame(
-            {
-                "dim_m": [1000],
-                "dim_n": [10],
-                "dim_k": [100000],
-            }
-        )
-        result = get_total_gflop_feature(df_asym)
+        features_asym = {
+            "dim_m": torch.tensor([1000]),
+            "dim_n": torch.tensor([10]),
+            "dim_k": torch.tensor([100000]),
+        }
+        result = get_total_gflop_feature(dict_of_features=features_asym)
         expected = (2 * 1000 * 10 * 100000) / 1e9
-        self.assertAlmostEqual(result.iloc[0], expected)
+        self.assertAlmostEqual(result[0], expected)
 
 
 class TestConfigParsing(TestCase):

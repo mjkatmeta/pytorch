@@ -12,9 +12,6 @@ import time
 from collections.abc import Sequence
 from typing import Any, Optional
 
-import numpy as np
-import pandas as pd  # type: ignore[import-untyped]
-
 import torch
 import torch._inductor.config as config
 import torch.nn as nn
@@ -52,7 +49,7 @@ class NeuralNetwork(nn.Module):
         self.n_inputs = n_inputs
         self.kernel_overhead = kernel_overhead
         self.log_kernel_overhead: float = torch.log(
-            torch.tensor(kernel_overhead, device="cuda")
+            torch.tensor(kernel_overhead, device=torch.device("cuda"))
         ).item()
         all_layer_widths = list(hidden_layer_widths) + [1]
         all_input_widths = [n_inputs] + list(hidden_layer_widths)
@@ -78,7 +75,9 @@ class NeuralNetwork(nn.Module):
         """
         log_base_pred = self.linear_relu_stack(x)
         log_overhead_tsr = torch.full_like(
-            input=log_base_pred, fill_value=self.log_kernel_overhead, device="cuda"
+            input=log_base_pred,
+            fill_value=self.log_kernel_overhead,
+            device=torch.device("cuda"),
         )
         return torch.logsumexp(
             torch.stack([log_base_pred, log_overhead_tsr], dim=-1), dim=-1
@@ -86,71 +85,91 @@ class NeuralNetwork(nn.Module):
 
 
 def get_nn_x(
-    df: pd.DataFrame,
+    dict_of_features: dict[str, torch.Tensor],
     mean: Optional[torch.Tensor] = None,
     std: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Standardize the data and convert it to a tensor."""
-    x_df = df[
-        [
-            "dtype_size",
-            "dim_m",
-            "dim_n",
-            "dim_k",
-            "total_gb",
-            "total_gflop",
-            "flops_per_byte",
-            "config_block_k",
-            "config_block_m",
-            "config_block_n",
-            "config_num_stages",
-            "config_num_warps",
-        ]
-    ].copy()
-    for col in x_df.columns:
-        x_df[col] = np.log(x_df[col])
+    """
+    Take logs, standardize the data, and convert it to a tensor.
 
-    x_tens = torch.from_numpy(x_df.astype(float).to_numpy()).to(device="cuda")
+    Args:
+        dict_of_features: Dict mapping feature names to 1d tensors
+        mean: Mean values for standardizing input features. Optional.
+        std: Standard deviation values for standardizing input features.
+            Optional.
+    """
+    col_order = [
+        "dtype_size",
+        "dim_m",
+        "dim_n",
+        "dim_k",
+        "total_gb",
+        "total_gflop",
+        "flops_per_byte",
+        "config_block_k",
+        "config_block_m",
+        "config_block_n",
+        "config_num_stages",
+        "config_num_warps",
+    ]
+    x_tens = torch.stack(
+        [torch.log(dict_of_features[col].to(dtype=torch.float64)) for col in col_order],
+        dim=-1,
+    ).to(device=torch.device("cuda"))
+
     if mean is None:
-        mean = torch.from_numpy(x_df.mean().to_numpy()).to(device="cuda")
+        mean = x_tens.mean(dim=0)
     if std is None:
-        std = torch.from_numpy(x_df.std().to_numpy()).to(device="cuda")
+        std = x_tens.std(dim=0)
     x_tens -= mean
     x_tens /= std
     return x_tens.to(torch.float32), mean, std
 
 
-def get_total_gb_feature(df: pd.DataFrame) -> pd.Series:
+def get_total_gb_feature(dict_of_features: dict[str, torch.Tensor]) -> torch.Tensor:
     """
-    Calculate the total gigabytes feature from the dataframe.
+    Calculate the total gigabytes feature.
 
     Args:
-        df: DataFrame containing the necessary columns for calculation
+        dict_of_features: Dict mapping feature names to 1d tensors. Must include
+            keys "dim_m", "dim_n", "dim_k", and "dtype_size".
 
     Returns:
-        Series containing the calculated total gigabytes
+        Tensor containing the calculated total gigabytes
     """
     # Calculate memory access in bytes
-    m, n, k = df["dim_m"], df["dim_n"], df["dim_k"]
-    dtype_size = df["dtype_size"] / 8  # Convert bits to bytes
+    m, n, k = (
+        dict_of_features["dim_m"],
+        dict_of_features["dim_n"],
+        dict_of_features["dim_k"],
+    )
+    # Convert bits to bytes
+    dtype_size = dict_of_features["dtype_size"] / 8
 
+    # Convert to GB
     # A: m×k, B: k×n, C: m×n
-    return ((m * k + k * n + m * n) * dtype_size) / 1e9  # Convert to GB
+    return ((m * k + k * n + m * n) * dtype_size) / 1e9
 
 
-def get_total_gflop_feature(df: pd.DataFrame) -> pd.Series:
+def get_total_gflop_feature(dict_of_features: dict[str, torch.Tensor]) -> torch.Tensor:
     """
-    Calculate the total gigaflops feature from the dataframe.
+    Calculate the total gigaflops feature.
 
     Args:
-        df: DataFrame containing the necessary columns for calculation
+        dict_of_features: Dict mapping feature names to 1d tensors. Must include
+            keys "dim_m", "dim_n", and "dim_k".
 
     Returns:
-        Series containing the calculated total gigaflops
+        Tensor containing the calculated total gigaflops
     """
     # For matrix multiplication, flops = 2 * m * n * k
-    m, n, k = df["dim_m"], df["dim_n"], df["dim_k"]
-    return (2 * m * n * k) / 1e9  # Convert to GFLOP
+    m, n, k = (
+        dict_of_features["dim_m"],
+        dict_of_features["dim_n"],
+        dict_of_features["dim_k"],
+    )
+    # Convert to GFLOP
+    return (2 * m * n * k) / 1e9
 
 
 def _sanitize_path(input_string: str) -> str:
@@ -227,7 +246,7 @@ class ModelWrapper:
                 0.9045909,
                 1.28331208,
             ],
-            device="cuda",
+            device=torch.device("cuda"),
         )
 
         # Standard deviation values for standardizing input features
@@ -246,7 +265,7 @@ class ModelWrapper:
                 0.57455891,
                 0.5837217,
             ],
-            device="cuda",
+            device=torch.device("cuda"),
         )
 
     def vec(
@@ -307,29 +326,41 @@ class ModelWrapper:
             raise ValueError(f"Unsupported dtype: {dtype}. Add support for this dtype.")
 
         # Create feature dataframe
-        df = pd.DataFrame(
-            columns=[
-                "dim_m",
-                "dim_n",
-                "dim_k",
-                "dtype_size",
-                "config_block_m",
-                "config_block_n",
-                "config_block_k",
-                "config_num_stages",
-                "config_num_warps",
-            ],
-            data=[self.vec(m, n, k, dsize, config) for config in configs],
+        feature_names = [
+            "dim_m",
+            "dim_n",
+            "dim_k",
+            "dtype_size",
+            "config_block_m",
+            "config_block_n",
+            "config_block_k",
+            "config_num_stages",
+            "config_num_warps",
+        ]
+        tensor = torch.stack(
+            [torch.tensor(self.vec(m, n, k, dsize, config)) for config in configs],
+            dim=0,
+        )
+        dict_of_features = dict(
+            zip(feature_names, (tensor[:, i] for i in range(tensor.shape[1])))
         )
 
         # Calculate derived features
-        df["total_gb"] = get_total_gb_feature(df=df).astype(np.float32)
-        df["total_gflop"] = get_total_gflop_feature(df=df).astype(np.float32)
-        df["flops_per_byte"] = df["total_gflop"] / df["total_gb"]
+        dict_of_features["total_gb"] = get_total_gb_feature(
+            dict_of_features=dict_of_features
+        )
+        dict_of_features["total_gflop"] = get_total_gflop_feature(
+            dict_of_features=dict_of_features
+        )
+        dict_of_features["flops_per_byte"] = (
+            dict_of_features["total_gflop"] / dict_of_features["total_gb"]
+        )
 
         # Standardize the input
         inp, _, _ = get_nn_x(
-            df=df, mean=self.mean_for_standardization, std=self.std_for_standardization
+            dict_of_features=dict_of_features,
+            mean=self.mean_for_standardization,
+            std=self.std_for_standardization,
         )
         inp.to(device="cuda")
 
