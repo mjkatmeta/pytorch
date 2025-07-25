@@ -1530,8 +1530,8 @@ def use_triton_template(
             or (layout.device.type == "cpu" and layout.dtype in layout_dtypes)
         )
         and (
-            config.max_autotune 
-            or config.max_autotune_gemm 
+            config.max_autotune
+            or config.max_autotune_gemm
             or config.matmul_gemm_autotune_benchmark_space != "SAME"
         )
         and _use_autotune_backend("TRITON")
