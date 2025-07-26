@@ -195,7 +195,8 @@ class ModelWrapper:
 
     MODEL_BASE_NAME = "triton_mm"
 
-    def _device_name_projection(self, device_name: str) -> Optional[str]:
+    @classmethod
+    def _device_name_projection(cls, device_name: str) -> Optional[str]:
         """
         Project device name to a common format.
 
@@ -211,18 +212,19 @@ class ModelWrapper:
             return "AMD INSTINCT MI300X"
         return None
 
-    def _get_device_model_path(self, device_name: str) -> Optional[str]:
+    @classmethod
+    def _get_device_model_path(cls, device_name: str) -> Optional[str]:
         if config.fast_autotune_model_directory is None:
             base_directory = os.path.dirname(__file__)
         else:
             base_directory = config.fast_autotune_model_directory
-        new_device_name = self._device_name_projection(device_name)
+        new_device_name = cls._device_name_projection(device_name)
         if new_device_name is None:
             return None
 
         file_name = _sanitize_path(new_device_name)
         return os.path.join(
-            base_directory, "artifacts", f"{file_name}_{self.MODEL_BASE_NAME}.pt2"
+            base_directory, "artifacts", f"{file_name}_{cls.MODEL_BASE_NAME}.pt2"
         )
 
     def __init__(self, device_name: Optional[str] = None) -> None:
@@ -243,9 +245,7 @@ class ModelWrapper:
         print("Model path exists: ", os.path.exists(model_path))
         if not os.path.exists(model_path):
             print("Model path does not exist: %s", model_path)
-            raise RuntimeError(
-                f"Model path not found for device {device_name}. "
-            )
+            raise RuntimeError(f"Model path not found for device {device_name}. ")
 
         start_time = time.time()
         self.model = torch._inductor.aoti_load_package(model_path)
@@ -422,7 +422,12 @@ import functools
 
 
 @functools.lru_cache
-def get_model() -> Optional[ModelWrapper]:
+def get_model(device_name: Optional[str]) -> Optional[ModelWrapper]:
     if not torch.cuda.is_available():
         return None
-    return ModelWrapper()
+    if device_name is None:
+        device_name = torch.cuda.get_device_name()
+    model_path = ModelWrapper._get_device_model_path(device_name)
+    if model_path is None:
+        return None
+    return ModelWrapper(device_name)
