@@ -235,6 +235,7 @@ class ModelWrapper:
             device_name = torch.cuda.get_device_name()
         model_path = self._get_device_model_path(device_name)
         if model_path is None:
+
             raise RuntimeError(
                 f"Model path not found for device {device_name}. "
                 "Please check that the device is supported."
@@ -242,6 +243,14 @@ class ModelWrapper:
         # check to see if model_path exists
         # TODO remove logging
         print("Loading NN Kernel Prediction Model from ", model_path)
+        # List files in the model path directory
+        model_dir = os.path.dirname(model_path)
+        print("Files in model directory:", os.listdir(model_dir))
+
+        # List files in the parent directory of the model path
+        parent_dir = os.path.dirname(model_dir)
+        print("Files in parent directory:", os.listdir(parent_dir))
+
         print("Model path exists: ", os.path.exists(model_path))
         if not os.path.exists(model_path):
             print("Model path does not exist: %s", model_path)
