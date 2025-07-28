@@ -196,7 +196,7 @@ class ModelWrapper:
     MODEL_BASE_NAME = "triton_mm"
 
     @classmethod
-    def _device_name_projection(cls, device_name: str) -> Optional[str]:
+    def _device_name_projection(cls, device_name: str) -> str:
         """
         Project device name to a common format.
 
@@ -210,17 +210,15 @@ class ModelWrapper:
             return "NVIDIA H100"
         if "mi300x" in device_name or "MI300X" in device_name:
             return "AMD INSTINCT MI300X"
-        return None
+        return device_name
 
     @classmethod
-    def _get_device_model_path(cls, device_name: str) -> Optional[str]:
+    def _get_device_model_path(cls, device_name: str) -> str:
         if config.fast_autotune_model_directory is None:
             base_directory = os.path.dirname(__file__)
         else:
             base_directory = config.fast_autotune_model_directory
         new_device_name = cls._device_name_projection(device_name)
-        if new_device_name is None:
-            return None
 
         file_name = _sanitize_path(new_device_name)
         return os.path.join(
@@ -234,11 +232,6 @@ class ModelWrapper:
         if device_name is None:
             device_name = torch.cuda.get_device_name()
         model_path = self._get_device_model_path(device_name)
-        if model_path is None:
-            raise RuntimeError(
-                f"Model path not found for device {device_name}. "
-                "Please check that the device is supported."
-            )
         # check to see if model_path exists
         # TODO remove logging
         print("Loading NN Kernel Prediction Model from ", model_path)

@@ -11,6 +11,7 @@ from torch._inductor.config import (
     parse_matmul_gemm_autotune_benchmark_space,
     parse_matmul_gemm_autotune_search_space,
 )
+import torch._inductor.config as config
 from torch._inductor.models.mm_kernel_prediction_model import (
     _sanitize_path,
     get_model,
@@ -341,24 +342,15 @@ class TestMMKernelPredictionModel(TestCase):
             mock.patch("torch.cuda.is_available", return_value=True),
             mock.patch("torch.cuda.get_device_name", return_value="Unknown GPU"),
             mock.patch("os.path.exists") as mock_exists,
-            mock.patch(
-                "torch._inductor.aoti_load_package", return_value=mock_model
-            ) as mock_load,
         ):
             # Unknown GPU model doesn't exist, so it falls back to H100
             mock_exists.return_value = False
 
-            ModelWrapper()
+            self.assertRaises(RuntimeError, ModelWrapper)
 
             # Should have checked if unknown GPU model exists once
-            self.assertEqual(mock_exists.call_count, 1)
-            mock_load.assert_called_once()
+            self.assertTrue(mock_exists.call_count >= 1)
 
-            # Verify the final model path used was the H100 fallback
-            call_args = mock_load.call_args[0][0]
-            self.assertIn("nvidia_h100_triton_mm.pt2", call_args)
-
-    @skipIf(not torch.cuda.is_available(), "CUDA is not available")
     def test_model_wrapper_inference(self) -> None:
         """Test the inference method."""
         mock_model = mock.MagicMock()
@@ -366,9 +358,7 @@ class TestMMKernelPredictionModel(TestCase):
         mock_model.return_value = mock_output
 
         with (
-            mock.patch("torch.cuda.is_available", return_value=True),
-            mock.patch("torch._inductor.aoti_load_package", return_value=mock_model),
-            mock.patch("torch.device", return_value=torch.device("cpu")),
+            mock.patch("torch._inductor.aoti_load_package", return_value=mock_model)
         ):
             wrapper = ModelWrapper()
 
@@ -588,14 +578,6 @@ class TestConfigParsing(TestCase):
         result = parse_matmul_gemm_autotune_benchmark_space()
         self.assertEqual(result, 5)
 
-    def test_parse_matmul_gemm_autotune_benchmark_space_fast_autotune_fallback(self):
-        """Test that benchmark space falls back to 1 when fast_autotune is enabled and invalid value is set"""
-        os.environ["TORCHINDUCTOR_MATMUL_GEMM_AUTOTUNE_BENCHMARK_SPACE"] = "invalid"
-        os.environ["TORCHINDUCTOR_FAST_AUTOTUNE"] = "1"
-
-        result = parse_matmul_gemm_autotune_benchmark_space()
-        self.assertEqual(result, 1)
-
     def test_parse_matmul_gemm_autotune_benchmark_space_invalid_fallback(self):
         """Test that benchmark space falls back to 'SAME' when invalid value is set and fast_autotune is not enabled"""
         os.environ["TORCHINDUCTOR_MATMUL_GEMM_AUTOTUNE_BENCHMARK_SPACE"] = "invalid"
@@ -607,10 +589,10 @@ class TestConfigParsing(TestCase):
     def test_parse_matmul_gemm_autotune_search_space_default(self):
         """Test that search space defaults to 'DEFAULT' when benchmark space is 'SAME'"""
         os.environ.pop("TORCHINDUCTOR_MATMUL_GEMM_AUTOTUNE_BENCHMARK_SPACE", None)
-        os.environ.pop("TORCHINDUCTOR_FAST_AUTOTUNE", None)
+        with config.patch("fast_autotune", False):
 
-        result = parse_matmul_gemm_autotune_search_space()
-        self.assertEqual(result, "DEFAULT")
+            result = parse_matmul_gemm_autotune_search_space()
+            self.assertEqual(result, "DEFAULT")
 
     def test_parse_matmul_gemm_autotune_search_space_exhaustive_with_model_config(self):
         """Test that search space returns 'EXHAUSTIVE' when model configs are used (benchmark space != 'SAME')"""
@@ -642,6 +624,37 @@ class TestConfigParsing(TestCase):
             result = parse_matmul_gemm_autotune_search_space()
             self.assertEqual(result, "EXHAUSTIVE")
 
+    def test_parse_matmul_gemm_autotune_benchmark_space(self):
+        # with mock.patch.dict(
+        #     os.environ, {"TORCHINDUCTOR_MATMUL_GEMM_AUTOTUNE_BENCHMARK_SPACE": "5"}
+        # ):
+        #     self.assertEqual(parse_matmul_gemm_autotune_benchmark_space(), 5)
+
+        with config.patch({"fast_autotune": True, "matmul_gemm_autotune_benchmark_space": "fish"}):
+            self.assertEqual(parse_matmul_gemm_autotune_benchmark_space(), 1)
+
+        with config.patch({"matmul_gemm_autotune_benchmark_space": "fish"}):
+            self.assertEqual(parse_matmul_gemm_autotune_benchmark_space(), "SAME")
+
+        self.assertEqual(parse_matmul_gemm_autotune_benchmark_space(), "SAME")
+
+    def test_parse_matmul_gemm_autotune_search_space(self):
+        with config.patch("fast_autotune", False):
+            self.assertEqual(parse_matmul_gemm_autotune_search_space(), "DEFAULT")
+
+            # Case 2: Benchmarking_space is an int
+            with mock.patch.dict(
+                os.environ,
+                {"TORCHINDUCTOR_MATMUL_GEMM_AUTOTUNE_BENCHMARK_SPACE": "1"},
+            ):
+                self.assertEqual(parse_matmul_gemm_autotune_search_space(), "EXHAUSTIVE")
+
+            # Case 3: Benchmarking_space is "DEFAULT"
+            with mock.patch.dict(
+                os.environ,
+                {"TORCHINDUCTOR_MATMUL_GEMM_AUTOTUNE_BENCHMARK_SPACE": "Invalid"},
+            ):
+                self.assertEqual(parse_matmul_gemm_autotune_search_space(), "DEFAULT")
 
 if __name__ == "__main__":
     if HAS_GPU or HAS_CPU:

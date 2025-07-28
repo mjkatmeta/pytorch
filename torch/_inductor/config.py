@@ -472,7 +472,7 @@ max_autotune_conv_backends = os.environ.get(
 # This uses an ml model to predict the best config for a given kernel, then benchmarks this against aten.
 # The sweetspot for compile time cost vs performance somewhere between max_autotune and no max_autotune.
 # Equivalent to TORCHINDUCTOR_MATMUL_GEMM_AUTOTUNE_BENCHMARK_SPACE == 1 with max autotune
-fast_autotune = True
+fast_autotune = os.environ.get("TORCHINDUCTOR_FAST_AUTOTUNE") == "1"
 
 
 # Specify the size of the benchmarking space for GEMM autotuning with the neural network model.
@@ -482,7 +482,6 @@ fast_autotune = True
 def parse_matmul_gemm_autotune_benchmark_space() -> Union[
     int, Literal["SAME", "DEFAULT"]
 ]:
-    global fast_autotune
     value = os.environ.get("TORCHINDUCTOR_MATMUL_GEMM_AUTOTUNE_BENCHMARK_SPACE")
     if value is not None:
         value = value.upper()
@@ -493,7 +492,10 @@ def parse_matmul_gemm_autotune_benchmark_space() -> Union[
             return int(value)
         except ValueError:
             pass
-    if fast_autotune:
+    # Access fast_autotune through the module instead of using global
+    # This ensures it works when called from tests
+    import torch._inductor.config as config_module
+    if getattr(config_module, "fast_autotune", True):
         return 1
     return "SAME"
 
