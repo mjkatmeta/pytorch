@@ -235,7 +235,6 @@ class ModelWrapper:
             device_name = torch.cuda.get_device_name()
         model_path = self._get_device_model_path(device_name)
         if model_path is None:
-
             raise RuntimeError(
                 f"Model path not found for device {device_name}. "
                 "Please check that the device is supported."
@@ -431,7 +430,7 @@ import functools
 
 
 @functools.lru_cache
-def get_model(device_name: Optional[str]) -> Optional[ModelWrapper]:
+def get_model(device_name: Optional[str] = None) -> Optional[ModelWrapper]:
     if not torch.cuda.is_available():
         return None
     if device_name is None:
