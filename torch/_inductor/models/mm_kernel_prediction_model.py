@@ -214,10 +214,10 @@ class ModelWrapper:
 
     @classmethod
     def _get_device_model_path(cls, device_name: str) -> str:
-        if config.fast_autotune_model_directory is None:
-            base_directory = os.path.dirname(__file__)
+        if config.fast_autotune_model_path is not None:
+            return config.fast_autotune_model_path
         else:
-            base_directory = config.fast_autotune_model_directory
+            base_directory = os.path.dirname(__file__)
         new_device_name = cls._device_name_projection(device_name)
 
         file_name = _sanitize_path(new_device_name)
