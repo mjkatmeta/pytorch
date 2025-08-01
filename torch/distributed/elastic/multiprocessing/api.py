@@ -37,7 +37,10 @@ from torch.distributed.elastic.multiprocessing.subprocess_handler import (
     SubprocessHandler,
 )
 from torch.distributed.elastic.multiprocessing.tail_log import TailLog
-from torch.distributed.numa.binding import maybe_wrap_with_numa_bindings, NumaOptions
+from torch.distributed.numa.binding import (
+    maybe_wrap_entrypoint_with_numa_bindings,
+    NumaOptions,
+)
 
 
 IS_WINDOWS = sys.platform == "win32"
@@ -598,6 +601,7 @@ def _wrap(
     stderr_redirects: dict[int, str],  # redirect file for stderr (to console if None)
     ret_vals: dict[int, mp.SimpleQueue],
     queue_finished_reading_event: synchronize.Event,
+    numa_options: Optional[NumaOptions] = None,
 ) -> None:
     # get the per-rank params up front so we fail fast if no mapping is found
     args_ = args[local_rank]
@@ -612,6 +616,10 @@ def _wrap(
 
     for k, v in env_.items():
         os.environ[k] = v
+
+    fn = maybe_wrap_entrypoint_with_numa_bindings(
+        entrypoint=fn, gpu_index=local_rank, numa_options=numa_options
+    )
 
     with stdout_cm, stderr_cm:
         ret = record(fn)(*args_)
@@ -631,6 +639,7 @@ class MultiprocessContext(PContext):
         start_method: str,
         logs_specs: LogsSpecs,
         log_line_prefixes: Optional[dict[int, str]] = None,
+        numa_options: Optional[NumaOptions] = None,
     ):
         super().__init__(
             name,
@@ -654,6 +663,7 @@ class MultiprocessContext(PContext):
         # Note: set method should ONLY be invoked for the use case when all processes finished
         # successfully. If any process died on event.wait() calling set() method will deadlock.
         self._worker_finished_event = mp.get_context(self.start_method).Event()
+        self._numa_options = numa_options
 
     def _start(self):
         if self._pc:
@@ -671,6 +681,7 @@ class MultiprocessContext(PContext):
                 self.stderrs,
                 self._ret_vals,
                 self._worker_finished_event,
+                self._numa_options,
             ),
             nprocs=self.nprocs,
             join=False,
@@ -814,10 +825,6 @@ class SubprocessContext(PContext):
         log_line_prefixes: Optional[dict[int, str]] = None,
         numa_options: Optional[NumaOptions] = None,
     ):
-        entrypoint, args = maybe_wrap_with_numa_bindings(
-            entrypoint=entrypoint, local_rank_to_args=args, numa_options=numa_options
-        )
-
         super().__init__(
             name,
             entrypoint,
@@ -831,6 +838,7 @@ class SubprocessContext(PContext):
         self._running_local_ranks: set[int] = set(range(self.nprocs))
         self._failures: dict[int, ProcessFailure] = {}
         self.subprocess_handlers: dict[int, SubprocessHandler] = {}
+        self._numa_options: Optional[NumaOptions] = numa_options
 
     def _start(self):
         if self.subprocess_handlers:
@@ -845,6 +853,7 @@ class SubprocessContext(PContext):
                 stdout=self.stdouts[local_rank],
                 stderr=self.stderrs[local_rank],
                 local_rank_id=local_rank,
+                numa_options=self._numa_options,
             )
             for local_rank in range(self.nprocs)
         }

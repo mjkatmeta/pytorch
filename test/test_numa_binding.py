@@ -222,7 +222,7 @@ class NumaBindingTest(TestCase):
     def _mock_sched_getaffinity(self, pid: int) -> set[int]:
         return set(range(self._mock_num_logical_cpus))
 
-    def _start_test_processes_and_get_command_args_for_local_rank(
+    def _start_process_with_str_and_get_command_args_for_local_rank(
         self, *, numa_options: Optional[NumaOptions], local_rank: int
     ) -> tuple[str, ...]:
         """
@@ -254,6 +254,70 @@ class NumaBindingTest(TestCase):
             )
             return call_args.kwargs["args"]
 
+    def _start_processes_with_callable_and_get_bindings_for_local_rank(
+        self,
+        *,
+        numa_options: Optional[NumaOptions],
+        target_local_rank: int,
+        should_raise_exception: bool = False,
+    ) -> Optional[set[int]]:
+        def mock_worker_function(x: int) -> int:
+            """Simple test function that doubles its input."""
+            return x * 2
+
+        active_local_rank = None
+        target_logical_cpu_indices = None
+
+        def mock_setaffinity(pid, cpu_set):
+            nonlocal target_logical_cpu_indices
+            if should_raise_exception:
+                raise OSError("Mock sched_setaffinity failure")
+            if active_local_rank == target_local_rank:
+                target_logical_cpu_indices = cpu_set
+
+        def mock_start_processes(fn, args, nprocs, *args_sequence, **kwargs):
+            nonlocal active_local_rank
+            for i in range(nprocs):
+                active_local_rank = i
+                fn(i, *args)
+
+            # Return a mock ProcessContext that indicates success
+            class MockProcessContext:
+                def join(self, timeout=None):
+                    return True  # Indicate all processes finished
+
+                def pids(self):
+                    return list(range(nprocs))
+
+            return MockProcessContext()
+
+        with (
+            patch("os.sched_setaffinity", mock_setaffinity),
+            patch(
+                "torch.distributed.elastic.multiprocessing.api.mp.start_processes",
+                mock_start_processes,
+            ),
+            # Prevent mock processes from hanging
+            patch(
+                "multiprocessing.synchronize.Event.wait",
+                lambda self, timeout=None: None,
+            ),
+        ):
+            start_processes(
+                name="test_process",
+                entrypoint=lambda s: s,
+                args=dict.fromkeys(
+                    range(self._mock_device_count()), ("Hello, world!",)
+                ),
+                envs={
+                    i: {"LOCAL_RANK": str(i)} for i in range(self._mock_device_count())
+                },
+                logs_specs=DefaultLogsSpecs(),
+                numa_options=numa_options,
+            )
+
+        return target_logical_cpu_indices
+
     def test_node_numa_binding(self) -> None:
         self._add_mock_hardware(
             num_sockets=4,
@@ -263,17 +327,16 @@ class NumaBindingTest(TestCase):
             num_physical_core_per_l3_cache=2,
         )
 
-        command_args = self._start_test_processes_and_get_command_args_for_local_rank(
+        command_args = self._start_process_with_str_and_get_command_args_for_local_rank(
             numa_options=NumaOptions(affinity_mode=AffinityMode.NODE), local_rank=11
         )
         self.assertEqual(
             command_args,
             # There are 8 numa nodes and 2 GPUs per numa node, so GPU 11 would be
-            # on numa node 11 // 2 = 5.
+            # on numa node 11 // 2 = 5. Node 5 has CPUs 80-95.
             (
                 "numactl",
-                "--cpunodebind=5",
-                "--preferred=5",
+                "--physcpubind=80-95",
                 "echo",
                 "Hello, world!",
             ),
@@ -288,7 +351,7 @@ class NumaBindingTest(TestCase):
             num_physical_core_per_l3_cache=2,
         )
 
-        command_args = self._start_test_processes_and_get_command_args_for_local_rank(
+        command_args = self._start_process_with_str_and_get_command_args_for_local_rank(
             numa_options=None, local_rank=11
         )
         self.assertEqual(
@@ -347,7 +410,7 @@ class NumaBindingTest(TestCase):
             ),
         ):
             command_args = (
-                self._start_test_processes_and_get_command_args_for_local_rank(
+                self._start_process_with_str_and_get_command_args_for_local_rank(
                     numa_options=NumaOptions(
                         affinity_mode=AffinityMode.NODE,
                         should_fall_back_if_binding_fails=True,
@@ -396,15 +459,15 @@ class NumaBindingTest(TestCase):
             num_physical_core_per_l3_cache=2,
         )
 
-        command_args = self._start_test_processes_and_get_command_args_for_local_rank(
+        command_args = self._start_process_with_str_and_get_command_args_for_local_rank(
             numa_options=NumaOptions(affinity_mode=AffinityMode.SOCKET), local_rank=15
         )
         self.assertEqual(
             command_args,
             (
                 "numactl",
-                "--cpunodebind=6-7",
-                "--preferred-many=6-7",
+                # GPU 15 is on numa node 7, socket 3. Socket 3 has numa nodes 6-7 with CPUs 96-127.
+                "--physcpubind=96-127",
                 "echo",
                 "Hello, world!",
             ),
@@ -419,15 +482,15 @@ class NumaBindingTest(TestCase):
             num_physical_core_per_l3_cache=2,
         )
 
-        command_args = self._start_test_processes_and_get_command_args_for_local_rank(
+        command_args = self._start_process_with_str_and_get_command_args_for_local_rank(
             numa_options=NumaOptions(affinity_mode=AffinityMode.SOCKET), local_rank=7
         )
         self.assertEqual(
             command_args,
             (
                 "numactl",
-                "--cpunodebind=3",
-                "--preferred=3",
+                # GPU 7 is on numa node 3, socket 3. Socket 3 has only numa node 3 with CPUs 48-63.
+                "--physcpubind=48-63",
                 "echo",
                 "Hello, world!",
             ),
@@ -442,8 +505,11 @@ class NumaBindingTest(TestCase):
             num_physical_core_per_l3_cache=3,
         )
 
-        command_args_0 = self._start_test_processes_and_get_command_args_for_local_rank(
-            numa_options=NumaOptions(affinity_mode=AffinityMode.EXCLUSIVE), local_rank=0
+        command_args_0 = (
+            self._start_process_with_str_and_get_command_args_for_local_rank(
+                numa_options=NumaOptions(affinity_mode=AffinityMode.EXCLUSIVE),
+                local_rank=0,
+            )
         )
         self.assertEqual(
             command_args_0,
@@ -451,14 +517,16 @@ class NumaBindingTest(TestCase):
                 "numactl",
                 # Gets an extra physical core due to odd number of physical cores on numa node
                 "--physcpubind=0-3",
-                "--preferred=0",
                 "echo",
                 "Hello, world!",
             ),
         )
 
-        command_args_1 = self._start_test_processes_and_get_command_args_for_local_rank(
-            numa_options=NumaOptions(affinity_mode=AffinityMode.EXCLUSIVE), local_rank=1
+        command_args_1 = (
+            self._start_process_with_str_and_get_command_args_for_local_rank(
+                numa_options=NumaOptions(affinity_mode=AffinityMode.EXCLUSIVE),
+                local_rank=1,
+            )
         )
         self.assertEqual(
             command_args_1,
@@ -466,7 +534,6 @@ class NumaBindingTest(TestCase):
                 "numactl",
                 # Does not get an extra physical core, since the 1st GPU already took the extra.
                 "--physcpubind=4-5",
-                "--preferred=0",
                 "echo",
                 "Hello, world!",
             ),
@@ -485,7 +552,7 @@ class NumaBindingTest(TestCase):
             RuntimeError,
             "There are only 1 physical cores on numa_node_index=0, but there are 2 GPUs associated with this NUMA node.",
         ):
-            self._start_test_processes_and_get_command_args_for_local_rank(
+            self._start_process_with_str_and_get_command_args_for_local_rank(
                 numa_options=NumaOptions(affinity_mode=AffinityMode.EXCLUSIVE),
                 local_rank=1,
             )
@@ -499,7 +566,7 @@ class NumaBindingTest(TestCase):
             num_physical_core_per_l3_cache=3,
         )
 
-        command_args = self._start_test_processes_and_get_command_args_for_local_rank(
+        command_args = self._start_process_with_str_and_get_command_args_for_local_rank(
             numa_options=NumaOptions(affinity_mode=AffinityMode.CORE_COMPLEX),
             local_rank=3,
         )
@@ -509,7 +576,6 @@ class NumaBindingTest(TestCase):
                 "numactl",
                 # The second L3 on the second numa node
                 "--physcpubind=24-29",
-                "--preferred=1",
                 "echo",
                 "Hello, world!",
             ),
@@ -524,7 +590,7 @@ class NumaBindingTest(TestCase):
             num_physical_core_per_l3_cache=3,
         )
 
-        command_args = self._start_test_processes_and_get_command_args_for_local_rank(
+        command_args = self._start_process_with_str_and_get_command_args_for_local_rank(
             numa_options=NumaOptions(affinity_mode=AffinityMode.CORE_COMPLEX),
             local_rank=3,
         )
@@ -535,7 +601,6 @@ class NumaBindingTest(TestCase):
                 # There are only 2 L3 caches, so the 4th GPU shares the same
                 # cores as the 3rd GPU.
                 "--physcpubind=6-11",
-                "--preferred=1",
                 "echo",
                 "Hello, world!",
             ),
@@ -553,7 +618,7 @@ class NumaBindingTest(TestCase):
         # Only some subset of the CPUs are available this time.
         with patch("os.sched_getaffinity", return_value={0, 4, 6, 7, 9}):
             command_args = (
-                self._start_test_processes_and_get_command_args_for_local_rank(
+                self._start_process_with_str_and_get_command_args_for_local_rank(
                     numa_options=NumaOptions(affinity_mode=AffinityMode.CORE_COMPLEX),
                     local_rank=0,
                 )
@@ -565,7 +630,6 @@ class NumaBindingTest(TestCase):
                 "numactl",
                 # Binds to the second L3 because it has the most available CPUs
                 "--physcpubind=6-7,9",
-                "--preferred=0",
                 "echo",
                 "Hello, world!",
             ),
@@ -584,7 +648,7 @@ class NumaBindingTest(TestCase):
             num_physical_core_per_l3_cache=1,
         )
 
-        command_args = self._start_test_processes_and_get_command_args_for_local_rank(
+        command_args = self._start_process_with_str_and_get_command_args_for_local_rank(
             numa_options=NumaOptions(affinity_mode=AffinityMode.CORE_COMPLEX),
             local_rank=0,
         )
@@ -593,32 +657,10 @@ class NumaBindingTest(TestCase):
             (
                 "numactl",
                 "--physcpubind=0-1",
-                "--preferred=0",
                 "echo",
                 "Hello, world!",
             ),
         )
-
-    def test_raises_error_if_numa_options_provided_for_callable_entrypoint(
-        self,
-    ) -> None:
-        # Inner import to avoid crashing if not torch.distributed.is_available()
-        from torch.distributed.elastic.agent.server.api import WorkerSpec
-
-        def mock_entrypoint() -> None:
-            pass
-
-        with self.assertRaisesRegex(ValueError, r".*numa_options.*"):
-            # not relevant to test, just pass in an arbitrary value
-            mock_rdzv_handler: Any = 0
-            WorkerSpec(
-                role="trainer",
-                # Only str entrypoint (e.g. "echo") is currently supported
-                entrypoint=mock_entrypoint,
-                local_world_size=8,
-                rdzv_handler=mock_rdzv_handler,
-                numa_options=NumaOptions(affinity_mode=AffinityMode.NODE),
-            )
 
     def test_raises_error_if_numactl_unavailable(self) -> None:
         self._add_mock_hardware(
@@ -632,7 +674,7 @@ class NumaBindingTest(TestCase):
             patch("shutil.which", return_value=None),
             self.assertRaisesRegex(RuntimeError, r".*numactl.*"),
         ):
-            self._start_test_processes_and_get_command_args_for_local_rank(
+            self._start_process_with_str_and_get_command_args_for_local_rank(
                 numa_options=NumaOptions(affinity_mode=AffinityMode.NODE), local_rank=0
             )
 
@@ -654,15 +696,15 @@ class NumaBindingTest(TestCase):
             contents="-1",
         )
 
-        command_args = self._start_test_processes_and_get_command_args_for_local_rank(
+        command_args = self._start_process_with_str_and_get_command_args_for_local_rank(
             numa_options=NumaOptions(affinity_mode=AffinityMode.NODE), local_rank=0
         )
         self.assertEqual(
             command_args,
             (
                 "numactl",
-                "--cpunodebind=0",
-                "--preferred=0",
+                # When numa node is stored as -1, it defaults to node 0
+                "--physcpubind=0-1",
                 "echo",
                 "Hello, world!",
             ),
@@ -675,6 +717,71 @@ class NumaBindingTest(TestCase):
 
     def test_get_range_str_from_ints(self) -> None:
         self.assertEqual(_get_ranges_str_from_ints([7, 0, 1, 6, 2, 4]), "0-2,4,6-7")
+
+    def test_callable_numa_binding_node_affinity(self) -> None:
+        self._add_mock_hardware(
+            num_sockets=4,
+            num_numa_nodes_per_socket=2,
+            num_gpus_per_numa_node=2,
+            num_l3_caches_per_numa_node=4,
+            num_physical_core_per_l3_cache=2,
+        )
+
+        target_cpu_indices = (
+            self._start_processes_with_callable_and_get_bindings_for_local_rank(
+                numa_options=NumaOptions(affinity_mode=AffinityMode.NODE),
+                target_local_rank=11,
+            )
+        )
+
+        # There are 8 numa nodes and 2 GPUs per numa node, so GPU 11 would be
+        # on numa node 11 // 2 = 5. Node 5 has CPUs 80-95.
+        expected_cpu_indices = set(range(80, 96))
+        self.assertEqual(target_cpu_indices, expected_cpu_indices)
+
+    def test_callable_numa_binding_with_fallback_enabled(self) -> None:
+        self._add_mock_hardware(
+            num_sockets=1,
+            num_numa_nodes_per_socket=1,
+            num_gpus_per_numa_node=1,
+            num_l3_caches_per_numa_node=1,
+            num_physical_core_per_l3_cache=1,
+        )
+
+        # Should not raise an exception when fallback is enabled
+        target_cpu_indices = (
+            self._start_processes_with_callable_and_get_bindings_for_local_rank(
+                numa_options=NumaOptions(
+                    affinity_mode=AffinityMode.NODE,
+                    should_fall_back_if_binding_fails=True,
+                ),
+                target_local_rank=0,
+                should_raise_exception=True,
+            )
+        )
+
+        # Should return None since sched_setaffinity failed and fallback is enabled
+        self.assertIsNone(target_cpu_indices)
+
+    def test_callable_numa_binding_with_fallback_disabled(self) -> None:
+        self._add_mock_hardware(
+            num_sockets=1,
+            num_numa_nodes_per_socket=1,
+            num_gpus_per_numa_node=1,
+            num_l3_caches_per_numa_node=1,
+            num_physical_core_per_l3_cache=1,
+        )
+
+        # Should raise an exception when fallback is disabled
+        with self.assertRaises(OSError):
+            self._start_processes_with_callable_and_get_bindings_for_local_rank(
+                numa_options=NumaOptions(
+                    affinity_mode=AffinityMode.NODE,
+                    should_fall_back_if_binding_fails=False,
+                ),
+                target_local_rank=0,
+                should_raise_exception=True,
+            )
 
 
 if __name__ == "__main__":

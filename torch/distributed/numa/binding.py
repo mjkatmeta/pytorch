@@ -1,3 +1,4 @@
+import functools
 import os
 import shutil
 import subprocess
@@ -6,7 +7,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Optional, TypeVar
+from typing import Callable, Optional, overload, TypeVar, Union
 
 import torch
 from torch._utils_internal import signpost_event
@@ -14,11 +15,10 @@ from torch.distributed.elastic.utils.logging import get_logger
 
 
 __all__ = [
-    "maybe_wrap_with_numa_bindings",
+    "maybe_wrap_entrypoint_with_numa_bindings",
     "AffinityMode",
     "NumaOptions",
 ]
-
 
 _NUMACTL_COMMAND = "numactl"
 
@@ -40,10 +40,10 @@ class AffinityMode(str, Enum):
 @dataclass(frozen=True)
 class NumaOptions:
     affinity_mode: AffinityMode
+
     """
-    If true, we will silently return the original command if any of the following occur:
-    - An exception is raised as we compute the wrapped command.
-    - During a dry run of the wrapped command, numactl fails for any reason.
+    If true, we will fall back to using the original command/entrypoint if we fail to compute
+    or apply NUMA bindings.
 
     You should avoid using this option! It is only intended as a safety mechanism for facilitating
     mass rollouts of numa binding.
@@ -51,131 +51,186 @@ class NumaOptions:
     should_fall_back_if_binding_fails: bool = False
 
 
-def maybe_wrap_with_numa_bindings(
+@overload
+def maybe_wrap_entrypoint_with_numa_bindings(
     *,
-    entrypoint: str,
-    local_rank_to_args: dict[int, tuple],
+    entrypoint: tuple[str, ...],
+    gpu_index: int,
     numa_options: Optional[NumaOptions],
-) -> tuple[str, dict[int, tuple]]:
-    """
-    Args:
-        entrypoint: The entrypoint to the program, such as might be input to Popen.
-            Example: "python"
-        local_rank_to_args: A mapping from local rank to args for the entrypoint.
-            Example: {0: ("trainer.py",)}
-        numa_options: See NumaOptions for details.
+) -> tuple[str, ...]: ...
 
-    Returns:
-        A tuple of (entrypoint, local_rank_to_args), basically transforming the inputs,
-        where the entrypoint and args may now involve numa binding.
-        Example: ("numactl", {"0": ("--cpunodebind=0", "--preferred=0", "python", "trainer.py")})
-    """
+
+@overload
+def maybe_wrap_entrypoint_with_numa_bindings(
+    *,
+    entrypoint: Callable,
+    gpu_index: int,
+    numa_options: Optional[NumaOptions],
+) -> Callable: ...
+
+
+def maybe_wrap_entrypoint_with_numa_bindings(
+    *,
+    entrypoint: Union[tuple[str, ...], Callable],
+    gpu_index: int,
+    numa_options: Optional[NumaOptions],
+) -> Union[tuple[str, ...], Callable]:
     if numa_options is None:
-        return (entrypoint, local_rank_to_args)
+        return entrypoint
 
-    wrapped_local_rank_to_args = {}
-    for local_rank, args in local_rank_to_args.items():
-        try:
-            numactl_command_options = _maybe_get_numactl_options(
-                command_args=(entrypoint, *[str(arg) for arg in args]),
-                gpu_index=local_rank,
+    try:
+        logical_cpu_indices = _get_logical_cpu_indices_to_bind_to(
+            gpu_index=gpu_index, numa_options=numa_options
+        )
+        logger.info(
+            "Will attempt to bind to logical_cpu_indices=%r", logical_cpu_indices
+        )
+
+        wrapped: Union[tuple[str, ...], Callable]
+        if callable(entrypoint):
+            wrapped = _bind_callable_to_logical_cpus(
+                _callable=entrypoint,
+                logical_cpu_indices=logical_cpu_indices,
                 numa_options=numa_options,
             )
-        except Exception:
-            if numa_options.should_fall_back_if_binding_fails:
-                # NOTE: If any element of the batch fails to apply NUMA bindings
-                # for any reason, we do not apply NUMA bindings to any element of the batch,
-                # for maximum safety. This only applies if fallback is enabled.
-                return (entrypoint, local_rank_to_args)
-            raise
-        wrapped_local_rank_to_args[local_rank] = (
-            *numactl_command_options,
-            entrypoint,
-            *args,
-        )
-    return (_NUMACTL_COMMAND, wrapped_local_rank_to_args)
-
-
-def _maybe_get_numactl_options(
-    *,
-    command_args: tuple[str, ...],
-    gpu_index: int,
-    numa_options: NumaOptions,
-) -> tuple[str, ...]:
-    """
-    Args:
-        command_args: The args for a command, such as might be input to Popen.
-            Example: ("python", "trainer.py")
-        gpu_index: The index of the GPU that will be used by the subprocess which executes command_args.
-            Example: 0
-        numa_options: See NumaOptions for details.
-
-    Returns:
-        Depending on numa_options, something like
-            ("--cpunodebind=0", "--preferred=0")
-    """
-    try:
-        _raise_if_numactl_not_available()
-        if numa_options.affinity_mode == AffinityMode.NODE:
-            numactl_command_options = _get_node_numactl_options(gpu_index=gpu_index)
-        elif numa_options.affinity_mode == AffinityMode.SOCKET:
-            numactl_command_options = _get_socket_numactl_options(gpu_index=gpu_index)
-        elif numa_options.affinity_mode == AffinityMode.EXCLUSIVE:
-            numactl_command_options = _get_exclusive_numactl_options(
-                gpu_index=gpu_index
-            )
-        elif numa_options.affinity_mode == AffinityMode.CORE_COMPLEX:
-            numactl_command_options = _get_core_complex_numactl_options(
-                gpu_index=gpu_index
-            )
         else:
-            raise ValueError(
-                f"Affinity mode {numa_options.affinity_mode} not supported."
+            wrapped = _bind_command_args_to_logical_cpus_and_validate(
+                command_args=entrypoint, logical_cpu_indices=logical_cpu_indices
             )
 
-        if numa_options.should_fall_back_if_binding_fails:
-            _raise_if_numactl_fails_dry_run(numactl_options=numactl_command_options)
+        logger.info("NUMA binding succeeded!")
         signpost_event(
             category="numa_binding",
-            name="wrap_command_success",
-            parameters={
-                "original_command_args": command_args,
-                "gpu_index": gpu_index,
-                "numa_options": numa_options,
-                "numactl_command_options": numactl_command_options,
-            },
+            name="binding_success",
+            parameters={"logical_cpu_indices": logical_cpu_indices},
         )
-        return numactl_command_options
+
+        return wrapped
     except Exception:
+        traceback_str = traceback.format_exc()
         signpost_event(
             category="numa_binding",
-            name="wrap_command_exception",
+            name="binding_exception",
             parameters={
-                "traceback": traceback.format_exc(),
-                "original_command_args": command_args,
                 "gpu_index": gpu_index,
                 "numa_options": numa_options,
+                "traceback": traceback_str,
             },
         )
         logger.exception(
-            """Failed to wrap command with NUMA bindings.
-            Input:
-                command_args=%r,
+            """Failed to determine proper NUMA bindings, with arguments:
                 gpu_index=%d,
                 numa_options=%r,
+                traceback=%r,
         """,
-            command_args,
             gpu_index,
             numa_options,
+            traceback_str,
         )
+        if numa_options.should_fall_back_if_binding_fails:
+            logger.warning(
+                "Falling back to original command after NUMA binding failed because fallback is enabled."
+            )
+            return entrypoint
         raise
 
 
-def _raise_if_numactl_fails_dry_run(*, numactl_options: tuple[str, ...]) -> None:
-    noop_args = _get_assembled_command_from_pieces(
+def _bind_callable_to_logical_cpus(
+    *,
+    _callable: Callable,
+    logical_cpu_indices: set[int],
+    numa_options: NumaOptions,
+) -> Callable:
+    # Use functools.partial with module-level function for picklability
+    wrapped_callable = functools.partial(
+        _bind_to_logical_cpus_then_invoke_entrypoint,
+        logical_cpu_indices,
+        _callable,
+        numa_options,
+    )
+    # Copy original callable's metadata
+    return functools.update_wrapper(wrapped_callable, _callable)
+
+
+TEntrypointReturn = TypeVar("TEntrypointReturn")
+
+
+def _bind_to_logical_cpus_then_invoke_entrypoint(
+    logical_cpu_indices: set[int],
+    entrypoint: Callable[..., TEntrypointReturn],
+    numa_options: NumaOptions,
+    *args: object,
+    **kwargs: object,
+) -> TEntrypointReturn:
+    try:
+        os.sched_setaffinity(0, logical_cpu_indices)
+        logger.info("Successfully applied NUMA bindings for callable entrypoint.")
+    except Exception:
+        traceback_str = traceback.format_exc()
+        logger.exception(
+            """Failed to apply NUMA bindings for callable entrypoint, with
+            logical_cpu_indices=%r,
+            traceback=%s
+        """,
+            logical_cpu_indices,
+            traceback_str,
+        )
+        signpost_event(
+            category="numa_binding",
+            name="apply_exception",
+            parameters={
+                "logical_cpu_indices": logical_cpu_indices,
+                "traceback": traceback_str,
+            },
+        )
+        if not numa_options.should_fall_back_if_binding_fails:
+            raise
+        logger.warning(
+            "Falling back to original entrypoint after failing to apply NUMA bindings"
+        )
+
+    return entrypoint(*args, **kwargs)
+
+
+def _bind_command_args_to_logical_cpus_and_validate(
+    command_args: tuple[str, ...], logical_cpu_indices: set[int]
+) -> tuple[str, ...]:
+    # Validate
+    _raise_if_numactl_cli_not_available()
+    _raise_if_numactl_cli_dry_run_fails(logical_cpu_indices=logical_cpu_indices)
+
+    return _get_numactl_cli_args(
+        logical_cpu_indices=logical_cpu_indices, original_command_args=command_args
+    )
+
+
+def _get_logical_cpu_indices_to_bind_to(
+    *, gpu_index: int, numa_options: NumaOptions
+) -> set[int]:
+    if numa_options.affinity_mode == AffinityMode.NODE:
+        return _get_logical_cpu_indices_to_bind_to_for_node_affinity(
+            gpu_index=gpu_index
+        )
+    if numa_options.affinity_mode == AffinityMode.SOCKET:
+        return _get_logical_cpu_indices_to_bind_to_for_socket_affinity(
+            gpu_index=gpu_index
+        )
+    if numa_options.affinity_mode == AffinityMode.EXCLUSIVE:
+        return _get_logical_cpu_indices_to_bind_to_for_exclusive_affinity(
+            gpu_index=gpu_index
+        )
+    if numa_options.affinity_mode == AffinityMode.CORE_COMPLEX:
+        return _get_logical_cpu_indices_to_bind_to_for_core_complex_affinity(
+            gpu_index=gpu_index
+        )
+    raise ValueError(f"Affinity mode {numa_options.affinity_mode} not supported.")
+
+
+def _raise_if_numactl_cli_dry_run_fails(*, logical_cpu_indices: set[int]) -> None:
+    noop_args = _get_numactl_cli_args(
+        logical_cpu_indices=logical_cpu_indices,
         # Execute arbitrary noop
-        command_args=("true",),
-        numactl_options=numactl_options,
+        original_command_args=("true",),
     )
     try:
         subprocess.run(
@@ -200,36 +255,42 @@ def _raise_if_numactl_fails_dry_run(*, numactl_options: tuple[str, ...]) -> None
         ) from e
 
 
-def _get_assembled_command_from_pieces(
-    *, command_args: tuple[str, ...], numactl_options: tuple[str, ...]
+def _get_numactl_cli_args(
+    *, logical_cpu_indices: set[int], original_command_args: tuple[str, ...]
 ) -> tuple[str, ...]:
     # Syntax for invoking a command but with numactl activated is numactl <args> command <args>
-    return (_NUMACTL_COMMAND, *numactl_options, *command_args)
+    logical_cpus_str = _get_ranges_str_from_ints(logical_cpu_indices)
+    return (
+        _NUMACTL_COMMAND,
+        f"--physcpubind={logical_cpus_str}",
+        *original_command_args,
+    )
 
 
-def _raise_if_numactl_not_available() -> None:
+def _raise_if_numactl_cli_not_available() -> None:
     if not shutil.which(_NUMACTL_COMMAND):
         raise RuntimeError(
             f"{_NUMACTL_COMMAND} shell command is required for NUMA bindings."
         )
 
 
-def _get_node_numactl_options(*, gpu_index: int) -> tuple[str, ...]:
+def _get_logical_cpu_indices_to_bind_to_for_node_affinity(
+    *, gpu_index: int
+) -> set[int]:
     """
     Core logic of 'node' numa strategy.
 
-    Returns options to be used with numactl. E.g.,
-    ("--cpunodebind=0", "--preferred=0").
+    Returns logical CPU indices to bind to for the given GPU.
     """
     numa_node_index = _get_numa_node_index_for_gpu_index(gpu_index=gpu_index)
-
-    return (
-        f"--cpunodebind={numa_node_index}",
-        f"--preferred={numa_node_index}",
+    return _get_allowed_logical_cpu_indices_for_numa_node(
+        numa_node_index=numa_node_index
     )
 
 
-def _get_socket_numactl_options(*, gpu_index: int) -> tuple[str, ...]:
+def _get_logical_cpu_indices_to_bind_to_for_socket_affinity(
+    *, gpu_index: int
+) -> set[int]:
     """
     Core logic of 'socket' numa strategy.
     """
@@ -240,19 +301,21 @@ def _get_socket_numactl_options(*, gpu_index: int) -> tuple[str, ...]:
     numa_node_indices = _get_numa_node_indices_for_socket_index(
         socket_index=socket_index
     )
-    numa_node_indices_str = _get_ranges_str_from_ints(numa_node_indices)
 
-    return (
-        f"--cpunodebind={numa_node_indices_str}",
-        (
-            f"--preferred-many={numa_node_indices_str}"
-            if len(numa_node_indices) > 1
-            else f"--preferred={numa_node_indices_str}"
-        ),
-    )
+    logical_cpu_indices = set()
+    for numa_node_index in numa_node_indices:
+        logical_cpu_indices.update(
+            _get_allowed_logical_cpu_indices_for_numa_node(
+                numa_node_index=numa_node_index
+            )
+        )
+
+    return logical_cpu_indices
 
 
-def _get_exclusive_numactl_options(*, gpu_index: int) -> tuple[str, ...]:
+def _get_logical_cpu_indices_to_bind_to_for_exclusive_affinity(
+    *, gpu_index: int
+) -> set[int]:
     """
     Core logic of 'exclusive' numa strategy.
     """
@@ -311,21 +374,18 @@ def _get_exclusive_numactl_options(*, gpu_index: int) -> tuple[str, ...]:
     )
 
     # Slice and flatten the logical CPUs from the selected physical cores
-    logical_cpu_indices_for_original_gpu = (
-        logical_cpu_index
-        for logical_cpu_indices in list(
-            physical_core_to_allowed_logical_cpu_indices.values()
-        )[start:end]
-        for logical_cpu_index in logical_cpu_indices
-    )
+    logical_cpu_indices_for_original_gpu = set()
+    for logical_cpu_indices in list(
+        physical_core_to_allowed_logical_cpu_indices.values()
+    )[start:end]:
+        logical_cpu_indices_for_original_gpu.update(logical_cpu_indices)
 
-    return (
-        f"--physcpubind={_get_ranges_str_from_ints(logical_cpu_indices_for_original_gpu)}",
-        f"--preferred={numa_node_index}",
-    )
+    return logical_cpu_indices_for_original_gpu
 
 
-def _get_core_complex_numactl_options(*, gpu_index: int) -> tuple[str, ...]:
+def _get_logical_cpu_indices_to_bind_to_for_core_complex_affinity(
+    *, gpu_index: int
+) -> set[int]:
     """
     Core logic of 'core-complex' numa strategy.
 
@@ -369,10 +429,7 @@ def _get_core_complex_numactl_options(*, gpu_index: int) -> tuple[str, ...]:
         max_level_cache_to_allowed_logical_cpu_indices.values()
     )[cache_index_for_original_gpu]
 
-    return (
-        f"--physcpubind={_get_ranges_str_from_ints(logical_cpu_indices_for_original_gpu)}",
-        f"--preferred={numa_node_index}",
-    )
+    return logical_cpu_indices_for_original_gpu
 
 
 K = TypeVar("K")
