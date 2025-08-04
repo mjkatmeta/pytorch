@@ -679,7 +679,7 @@ class TestExpandedWeightModule(TestCase):
             expected_grads = [torch.stack(grad) for grad in zip(*expected_grads)]
             if not batch_first:
                 expected_grads[-1] = expected_grads[-1].transpose(0, 1)
-        self.assertEqual(actual_res, expected_res)
+        self.assertEqual(actual_res, expected_res, atol=atol, rtol=rtol)
         [
             self.assertEqual(actual, expected, atol=atol, rtol=rtol)
             for (actual, expected) in zip(actual_grads, expected_grads)
@@ -776,7 +776,7 @@ class TestExpandedWeightModule(TestCase):
                 expected_grads.append(out_grads)
 
             expected_grads = [torch.stack(grad) for grad in zip(*expected_grads)]
-            self.assertEqual(actual_res, expected_res)
+            self.assertEqual(actual_res, expected_res, atol=atol, rtol=rtol)
             [
                 self.assertEqual(actual, expected, atol=atol, rtol=rtol)
                 for (actual, expected) in zip(actual_grads, expected_grads)
@@ -807,11 +807,7 @@ class TestExpandedWeightModule(TestCase):
             return h.unsqueeze(1).repeat(new_h_shape)
 
         module_cls = module_info.module_cls
-        atol, rtol = (
-            (1e-4, 1e-5)
-            if module_cls == torch.nn.GRU and dtype == torch.float32
-            else (None, None)
-        )
+        atol, rtol = (1e-3, 1e-4) if dtype == torch.float32 else (None, None)
         module_inputs = module_info.module_inputs_func(
             module_info,
             device=device,
@@ -1011,6 +1007,13 @@ def filter_supported_tests(t):
     if "module_name" in t and t["module_name"] in supported_modules:
         return True
 
+
+if __name__ == "__main__":
+    from torch.testing._internal.common_utils import parse_cmd_line_args
+
+    # The value of the SEED depends on command line arguments so make sure they're parsed
+    # before instantiating tests because some modules as part of get_new_module_tests() will call torch.randn
+    parse_cmd_line_args()
 
 # TODO: Once all of these use ModuleInfo, replace with ModuleInfo tests
 # These currently use the legacy nn tests

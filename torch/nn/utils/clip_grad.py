@@ -1,3 +1,5 @@
+# mypy: allow-untyped-decorators
+# mypy: allow-untyped-defs
 import functools
 import types
 import typing
@@ -14,14 +16,14 @@ from torch.utils._foreach_utils import (
 )
 
 
-__all__ = [
-    "clip_grad_norm_",
+__all__: list[str] = [
     "clip_grad_norm",
+    "clip_grad_norm_",
     "clip_grad_value_",
 ]
 
 
-_TensorOrTensors: TypeAlias = Union[
+_tensor_or_tensors: TypeAlias = Union[  # noqa: PYI042
     torch.Tensor,
     typing.Iterable[torch.Tensor],  # noqa: UP006 - needed until XLA's patch is updated
 ]
@@ -36,7 +38,7 @@ def _no_grad(func: Callable[_P, _R]) -> Callable[_P, _R]:
     clip_grad_norm_ and clip_grad_value_ themselves.
     """
 
-    def _no_grad_wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+    def _no_grad_wrapper(*args, **kwargs):
         with torch.no_grad():
             return func(*args, **kwargs)
 
@@ -46,7 +48,7 @@ def _no_grad(func: Callable[_P, _R]) -> Callable[_P, _R]:
 
 @_no_grad
 def _get_total_norm(
-    tensors: _TensorOrTensors,
+    tensors: _tensor_or_tensors,
     norm_type: float = 2.0,
     error_if_nonfinite: bool = False,
     foreach: Optional[bool] = None,
@@ -117,7 +119,7 @@ def _get_total_norm(
 
 @_no_grad
 def _clip_grads_with_norm_(
-    parameters: _TensorOrTensors,
+    parameters: _tensor_or_tensors,
     max_norm: float,
     total_norm: torch.Tensor,
     foreach: Optional[bool] = None,
@@ -127,9 +129,12 @@ def _clip_grads_with_norm_(
     The gradients will be scaled by the following calculation
 
     .. math::
-        grad = grad * \frac{max\_norm}{total\_norm + 1e-6}
+        grad = grad * \min(\frac{max\_norm}{total\_norm + 1e-6}, 1)
 
     Gradients are modified in-place.
+
+    Note: The scale coefficient is clamped to a maximum of 1.0 to prevent gradient amplification.
+    This ensures that gradients are only scaled down when the total norm exceeds max_norm.
 
     This function is equivalent to :func:`torch.nn.utils.clip_grad_norm_` with a pre-calculated
     total norm.
@@ -155,9 +160,7 @@ def _clip_grads_with_norm_(
         return
     grouped_grads: dict[
         tuple[torch.device, torch.dtype], tuple[list[list[Tensor]], list[int]]
-    ] = _group_tensors_by_device_and_dtype(
-        [grads]
-    )  # type: ignore[assignment]
+    ] = _group_tensors_by_device_and_dtype([grads])  # type: ignore[assignment]
 
     clip_coef = max_norm / (total_norm + 1e-6)
     # Note: multiplying by the clamped coef is redundant when the coef is clamped to 1, but doing so
@@ -181,7 +184,7 @@ def _clip_grads_with_norm_(
 
 @_no_grad
 def clip_grad_norm_(
-    parameters: _TensorOrTensors,
+    parameters: _tensor_or_tensors,
     max_norm: float,
     norm_type: float = 2.0,
     error_if_nonfinite: bool = False,
@@ -236,7 +239,7 @@ def clip_grad_norm_(
     category=FutureWarning,
 )
 def clip_grad_norm(
-    parameters: _TensorOrTensors,
+    parameters: _tensor_or_tensors,
     max_norm: float,
     norm_type: float = 2.0,
     error_if_nonfinite: bool = False,
@@ -253,7 +256,7 @@ def clip_grad_norm(
 
 @_no_grad
 def clip_grad_value_(
-    parameters: _TensorOrTensors,
+    parameters: _tensor_or_tensors,
     clip_value: float,
     foreach: Optional[bool] = None,
 ) -> None:
