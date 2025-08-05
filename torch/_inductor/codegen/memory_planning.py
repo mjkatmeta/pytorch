@@ -10,6 +10,7 @@ from typing import Any, Optional, Protocol, TYPE_CHECKING
 import sympy
 
 import torch
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils._ordered_set import OrderedSet
 
 from .. import config
@@ -142,6 +143,17 @@ class Allocation(AllocationTreeNode):
     allocated: bool = False
     pool: Optional[AllocationPool] = None
     offset: Optional[sympy.Expr] = None
+    earliest_available: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        has_unbacked_sym = False
+        for s in self.node.get_layout().size:
+            if free_unbacked_symbols(s):
+                has_unbacked_sym = True
+                break
+
+        if has_unbacked_sym:
+            self.earliest_available = self.get_live_ranges().begin
 
     @property
     def device(self):
@@ -185,6 +197,9 @@ class Allocation(AllocationTreeNode):
             f"pool={self.pool.name if self.pool else None}, "
             f"offset={self.offset})"
         )
+
+    def get_earliest_available(self):
+        return self.earliest_available
 
 
 @dataclasses.dataclass
@@ -377,14 +392,26 @@ class AllocationPool:
     names_to_del: list[str] = dataclasses.field(default_factory=list)
     creation_cache: dict[str, str] = dataclasses.field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        for block in self.root.allocations:
+            if isinstance(block, Allocation):
+                self.update_earliest_block(block)
+
     def allocate(self, block: Allocation, is_last: bool):
-        if self.restrict_live_range and not self.restrict_live_range.contains(
-            block.live_range
+        if (
+            self.restrict_live_range is not None
+            and not self.restrict_live_range.contains(block.live_range)
         ):
+            return False
+
+        block_earliest_available = block.get_earliest_available()
+        pool_begin = self.root.get_live_ranges().begin
+        if block_earliest_available and block_earliest_available > pool_begin:
             return False
 
         is_last = self.can_expand and is_last
         if self.root.allocate(block, is_last):
+            self.update_earliest_block(block)
             return True
 
         if is_last:
@@ -392,9 +419,22 @@ class AllocationPool:
 
         return False
 
+    def update_earliest_block(self, block: Allocation):
+        if block_earliest_available := block.get_earliest_available():
+            if self.restrict_live_range is None:
+                self.restrict_live_range = LiveRange(
+                    block_earliest_available, float("inf")
+                )
+            else:
+                self.restrict_live_range = LiveRange(
+                    min(self.restrict_live_range.begin, block_earliest_available),
+                    self.restrict_live_range.end,
+                )
+
     def allocate_at_end(self, block):
         block.mark_allocated()
         self.root = TemporalSplit([SpatialSplit(self.root, TemporalSplit([block]))])
+        self.update_earliest_block(block)
         return True
 
     def finalize(self, name):
