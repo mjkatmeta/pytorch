@@ -1,12 +1,17 @@
 set ADDITIONAL_OPTIONS=""
 set PYTHON_EXEC="python"
-if "%DESIRED_PYTHON%" == "3.13t" (
-    echo Python version is set to 3.13t
-    set "PYTHON_INSTALLER_URL=https://www.python.org/ftp/python/3.13.0/python-3.13.0-amd64.exe"
+
+:: Free threaded python is like 3.14t, 3.13t, etc
+if "%DESIRED_PYTHON:~-1%"=="t" (
     set ADDITIONAL_OPTIONS="Include_freethreaded=1"
-    set PYTHON_EXEC="python3.13t"
+    set PYTHON_EXEC="python%DESIRED_PYTHON%" %= @lint-ignore =%
+)
+
+if "%DESIRED_PYTHON:~0,4%"=="3.14" (
+    echo Python version is set to 3.14 or 3.14t
+    set "PYTHON_INSTALLER_URL=https://www.python.org/ftp/python/3.14.0/python-3.14.0rc1-arm64.exe"
 ) else (
-    echo DESIRED_PYTHON not defined, Python version is set to %DESIRED_PYTHON%
+    echo Python version is set to %DESIRED_PYTHON%
     set "PYTHON_INSTALLER_URL=https://www.python.org/ftp/python/%DESIRED_PYTHON%.0/python-%DESIRED_PYTHON%.0-amd64.exe" %= @lint-ignore =%
 )
 
