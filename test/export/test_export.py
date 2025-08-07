@@ -11196,7 +11196,8 @@ graph():
             ep.module()(4, torch.randn(4, 4))
 
     @testing.expectedFailureCppRuntime
-    @testing.expectedFailureRetraceabilityNonStrict  # no runtime asserts added for assert x == 3
+    @testing.expectedFailureRetraceability  # no runtime asserts added for assert x > 3
+    @testing.expectedFailureRetraceabilityNonStrict  # no runtime asserts added for assert x > 3
     def test_symint_input_ranges(self):
         class M(torch.nn.Module):
             def forward(self, x, y):
@@ -13268,7 +13269,8 @@ def forward(self, x, y):
         self.assertEqual(out2.shape, torch.ones(40).shape)
         with self.assertRaisesRegex(
             RuntimeError,
-            r"Runtime assertion failed for expression Eq\((.*)\) on node '.*'",
+            r"The size of tensor a \(40\) must match the size of tensor b \(20\) at non-singleton dimension 0",
+            # r"Runtime assertion failed for expression Eq\((.*)\) on node '.*'",
         ):  # fail only at runtime
             ep.module()(torch.randn(5, 8), torch.randn(4, 5), torch.randn(30))  # fail
 
@@ -14752,7 +14754,7 @@ def forward(self, x):
             node.target == torch.ops.aten._assert_scalar.default
             for node in ep.graph.nodes
         ].count(True)
-        self.assertEqual(num_asserts, 2)
+        self.assertEqual(num_asserts, 0)
         with self.assertRaises(RuntimeError):
             ep.module()(torch.randn(4, 2))
 

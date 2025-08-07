@@ -804,7 +804,7 @@ def _export_to_torch_ir(
                     disable_constraint_solver=disable_constraint_solver,
                     # currently the following 2 flags are tied together for export purposes,
                     # but untangle for sake of dynamo export api
-                    prefer_deferred_runtime_asserts_over_guards=True,
+                    prefer_deferred_runtime_asserts_over_guards=allow_complex_guards_as_runtime_asserts,
                     allow_complex_guards_as_runtime_asserts=allow_complex_guards_as_runtime_asserts,
                     _log_export_usage=_log_export_usage,
                     same_signature=same_signature,
