@@ -439,7 +439,7 @@ def build_torchvision(
         build_vars += f"BUILD_VERSION={version}.dev{build_date}"
     elif build_version is not None:
         build_vars += (
-            f"BUILD_VERSION={build_version} PYTORCH_VERSION={branch[1:].split('-')[0]}"
+            f"BUILD_VERSION={build_version} PYTORCH_VERSION={branch[1:].split('-', maxsplit=1)[0]}"
         )
     if host.using_docker():
         build_vars += " CMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=0x10000"
@@ -496,7 +496,7 @@ def build_torchdata(
         build_vars += f"BUILD_VERSION={version}.dev{build_date}"
     elif build_version is not None:
         build_vars += (
-            f"BUILD_VERSION={build_version} PYTORCH_VERSION={branch[1:].split('-')[0]}"
+            f"BUILD_VERSION={build_version} PYTORCH_VERSION={branch[1:].split('-', maxsplit=1)[0]}"
         )
     if host.using_docker():
         build_vars += " CMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=0x10000"
@@ -554,7 +554,7 @@ def build_torchtext(
         build_vars += f"BUILD_VERSION={version}.dev{build_date}"
     elif build_version is not None:
         build_vars += (
-            f"BUILD_VERSION={build_version} PYTORCH_VERSION={branch[1:].split('-')[0]}"
+            f"BUILD_VERSION={build_version} PYTORCH_VERSION={branch[1:].split('-', maxsplit=1)[0]}"
         )
     if host.using_docker():
         build_vars += " CMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=0x10000"
@@ -614,7 +614,7 @@ def build_torchaudio(
         build_vars += f"BUILD_VERSION={version}.dev{build_date}"
     elif build_version is not None:
         build_vars += (
-            f"BUILD_VERSION={build_version} PYTORCH_VERSION={branch[1:].split('-')[0]}"
+            f"BUILD_VERSION={build_version} PYTORCH_VERSION={branch[1:].split('-', maxsplit=1)[0]}"
         )
     if host.using_docker():
         build_vars += " CMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=0x10000"
